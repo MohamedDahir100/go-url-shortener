@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"os"
-	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 type ShortenRequest struct {
@@ -19,40 +22,14 @@ type ShortenResponse struct {
 	Code     string `json:"code"`
 }
 
-// thread-safe in-memory store: code -> originalURL
-type MemoryStore struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{data: make(map[string]string)}
-}
-
-func (s *MemoryStore) Get(code string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v, ok := s.data[code]
-	return v, ok
-}
-
-func (s *MemoryStore) Set(code, url string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data[code] = url
-}
-
-// generate a URL-safe random code of length n
 func generateShortCode(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-
-	// base64 URL-safe; remove padding; take first n chars
 	code := base64.RawURLEncoding.EncodeToString(b)
 	if len(code) < n {
-		return "", nil
+		return "", fmt.Errorf("generated code too short")
 	}
 	return code[:n], nil
 }
@@ -62,20 +39,52 @@ func main() {
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
 
-	store := NewMemoryStore()
+	// --- Config (env-based) ---
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	baseURL := os.Getenv("BASE_URL")
+	if baseURL == "" {
+		baseURL = "http://localhost:" + port
+	}
+
+	redisHost := os.Getenv("REDIS_HOST")
+	if redisHost == "" {
+		redisHost = "localhost"
+	}
+
+	redisPort := os.Getenv("REDIS_PORT")
+	if redisPort == "" {
+		redisPort = "6379"
+	}
+
+	redisAddr := fmt.Sprintf("%s:%s", redisHost, redisPort)
+
+	// --- Redis client ---
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
 	})
 
-	r.GET("/:code", func(c *gin.Context) {
-		code := c.Param("code")
-		originalURL, ok := store.Get(code)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "url not found"})
-			return
+	ctx := context.Background()
+
+	// Optional but very useful: fail fast if Redis isn't reachable
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		// Keep running, but make it obvious Redis isn't connected
+		// In production you might exit; for dev, we log and continue.
+		fmt.Printf("WARNING: could not connect to Redis at %s: %v\n", redisAddr, err)
+	} else {
+		fmt.Printf("Connected to Redis at %s\n", redisAddr)
+	}
+
+	r.GET("/health", func(c *gin.Context) {
+		// include redis health signal
+		redisOK := true
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			redisOK = false
 		}
-		c.Redirect(http.StatusFound, originalURL)
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "redis": redisOK})
 	})
 
 	r.POST("/shorten", func(c *gin.Context) {
@@ -85,12 +94,6 @@ func main() {
 			return
 		}
 
-		baseURL := os.Getenv("BASE_URL")
-		if baseURL == "" {
-			baseURL = "http://localhost:8080"
-		}
-
-		// Generate with collision retries (rare, but interview-worthy)
 		const codeLen = 7
 		const maxAttempts = 5
 
@@ -101,7 +104,14 @@ func main() {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate code"})
 				return
 			}
-			if _, exists := store.Get(newCode); !exists {
+
+			// SETNX: set only if key does not already exist (atomic collision avoidance)
+			ok, err := rdb.SetNX(ctx, newCode, req.OriginalURL, 0).Result()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "redis error"})
+				return
+			}
+			if ok {
 				code = newCode
 				break
 			}
@@ -112,18 +122,30 @@ func main() {
 			return
 		}
 
-		store.Set(code, req.OriginalURL)
-
 		c.JSON(http.StatusOK, ShortenResponse{
 			ShortURL: baseURL + "/" + code,
 			Code:     code,
 		})
 	})
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	r.GET("/:code", func(c *gin.Context) {
+		code := c.Param("code")
+
+		originalURL, err := rdb.Get(ctx, code).Result()
+		if err == redis.Nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "url not found"})
+			return
+		}
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "redis error"})
+			return
+		}
+
+		c.Redirect(http.StatusFound, originalURL)
+	})
+
+	// Small graceful shutdown hint: give redis timeouts if you expand later
+	_ = rdb.WithTimeout(5 * time.Second)
 
 	_ = r.Run(":" + port)
 }
